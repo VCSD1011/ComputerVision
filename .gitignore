@@ -1,207 +1,339 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+"""
+Image Deblurring Script
+========================
+Usage:
+    python deblur_image.py --image path/to/image.jpg --blur gaussian --sigma 2
+    python deblur_image.py --image path/to/image.jpg --blur motion --length 20 --angle 45
+    python deblur_image.py --image path/to/image.jpg --blur defocus --radius 10
 
-# C extensions
-*.so
+Methods: Wiener Filter + Richardson-Lucy
+Output:  deblurred_wiener.png, deblurred_rl.png, comparison.png
+"""
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import argparse
+import os
+import warnings
+warnings.filterwarnings('ignore')
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+from scipy.signal import fftconvolve
+from skimage import img_as_float, io
+from skimage.draw import disk
+from skimage.color import rgb2gray
+# ──────────────────────────────────────────────
+# 1. PSF (Blur Kernel) Builders
+# ──────────────────────────────────────────────
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+def gaussian_psf(sigma, size=None):
+    """Gaussian blur kernel."""
+    if size is None:
+        size = int(6 * sigma + 1) | 1  # ensure odd
+    k = size // 2
+    y, x = np.mgrid[-k:k+1, -k:k+1]
+    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    return g / g.sum()
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
+def motion_psf(length, angle_deg):
+    """Linear motion blur kernel."""
+    size = 2 * length + 1
+    psf = np.zeros((size, size))
+    cx = cy = size // 2
+    angle = np.deg2rad(angle_deg)
+    for i in range(-length // 2, length // 2 + 1):
+        x = int(round(cx + i * np.cos(angle)))
+        y = int(round(cy + i * np.sin(angle)))
+        if 0 <= x < size and 0 <= y < size:
+            psf[y, x] = 1
+    s = psf.sum()
+    return psf / s if s > 0 else psf
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
 
-# Flask stuff:
-instance/
-.webassets-cache
+def defocus_psf(radius):
+    """Disk/defocus blur kernel."""
+    size = 2 * radius + 3
+    psf = np.zeros((size, size))
+    rr, cc = disk((size // 2, size // 2), radius, shape=psf.shape)
+    psf[rr, cc] = 1
+    s = psf.sum()
+    return psf / s if s > 0 else psf
+# ──────────────────────────────────────────────
+# 2. Wiener Filter (Frequency Domain)
+# ──────────────────────────────────────────────
 
-# Scrapy stuff:
-.scrapy
+def wiener_filter(blurred, psf, K=0.01):
+    """
+    Wiener deconvolution.
+    K: noise-to-signal ratio regularization parameter.
+       Lower K = sharper but noisier. Higher K = smoother.
+    """
+    def _channel(b, psf, K):
+        H = np.fft.rfft2(psf, s=b.shape)
+        B = np.fft.rfft2(b)
+        W = np.conj(H) / (np.abs(H)**2 + K)
+        restored = np.fft.irfft2(W * B, s=b.shape)
+        return np.clip(restored, 0, 1)
 
-# Sphinx documentation
-docs/_build/
+    if blurred.ndim == 3:
+        return np.stack([_channel(blurred[:, :, c], psf, K) for c in range(blurred.shape[2])], axis=2)
+    return _channel(blurred, psf, K)
+# ──────────────────────────────────────────────
+# 3. Richardson-Lucy Deconvolution (Iterative)
+# ──────────────────────────────────────────────
 
-# PyBuilder
-.pybuilder/
-target/
+def richardson_lucy(blurred, psf, iterations=30):
+    """
+    Richardson-Lucy iterative deconvolution.
+    More iterations = sharper but may amplify noise.
+    """
+    psf_flip = psf[::-1, ::-1]
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    def _channel(b, psf, psf_flip, iters):
+        u = np.full_like(b, 0.5)
+        for _ in range(iters):
+            conv = fftconvolve(u, psf, mode='same')
+            conv = np.where(conv < 1e-9, 1e-9, conv)
+            u *= fftconvolve(b / conv, psf_flip, mode='same')
+            np.clip(u, 0, 1, out=u)
+        return u
 
-# IPython
-profile_default/
-ipython_config.py
+    if blurred.ndim == 3:
+        return np.stack([_channel(blurred[:, :, c], psf, psf_flip, iterations) for c in range(blurred.shape[2])], axis=2)
+    return _channel(blurred, psf, psf_flip, iterations)
+def compute_psnr(original, restored):
+    from skimage.metrics import peak_signal_noise_ratio
+    return peak_signal_noise_ratio(original, restored, data_range=1.0)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+def compute_ssim(original, restored):
+    from skimage.metrics import structural_similarity
+    kw = dict(data_range=1.0)
+    if original.ndim == 3:
+        kw['channel_axis'] = 2
+    return structural_similarity(original, restored, **kw)
+# ──────────────────────────────────────────────
+# 6. Main
+# ──────────────────────────────────────────────
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+def main():
+    parser = argparse.ArgumentParser(description='Deblur an image using Wiener or Richardson-Lucy.')
+    parser.add_argument('--image',    required=True,          help='Path to input image')
+    parser.add_argument('--blur',     default='gaussian',     choices=['gaussian', 'motion', 'defocus'],
+                        help='Blur type to simulate (ignored if --no-simulate)')
+    parser.add_argument('--sigma',    type=float, default=2,  help='Sigma for Gaussian blur')
+    parser.add_argument('--length',   type=int,   default=20, help='Length for motion blur')
+    parser.add_argument('--angle',    type=float, default=0,  help='Angle (degrees) for motion blur')
+    parser.add_argument('--radius',   type=int,   default=10, help='Radius for defocus blur')
+    parser.add_argument('--K',        type=float, default=0.01, help='Wiener regularization param (default 0.01)')
+    parser.add_argument('--iters',    type=int,   default=30, help='Richardson-Lucy iterations (default 30)')
+    parser.add_argument('--no-simulate', action='store_true',
+                        help='Treat input image as already blurred (no additional blur applied)')
+    parser.add_argument('--outdir',   default='.',            help='Output directory (default: current dir)')
+    args = parser.parse_args()
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+    os.makedirs(args.outdir, exist_ok=True)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+    # Load image
+    #print(f"\n📂 Loading image: {args.image}")
+    image = img_as_float(io.imread("000039.png"))
+    if image.ndim == 2:
+        print("   Grayscale image detected.")
+    else:
+        print(f"   Color image detected — shape: {image.shape}")
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+    # Trim to multiple of 2 (avoids FFT edge issues)
+    h, w = image.shape[:2]
+    image = image[:h - h % 2, :w - w % 2]
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    # Build PSF
+    if args.blur == 'gaussian':
+        psf = gaussian_psf(args.sigma)
+        blur_desc = f"Gaussian σ={args.sigma}"
+    elif args.blur == 'motion':
+        psf = motion_psf(args.length, args.angle)
+        blur_desc = f"Motion {args.length}px @ {args.angle}°"
+    else:
+        psf = defocus_psf(args.radius)
+        blur_desc = f"Defocus r={args.radius}"
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    print(f"   PSF: {blur_desc}  (kernel size: {psf.shape})")
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    # Simulate blur or use as-is
+    if args.no_simulate:
+        blurred = image
+        original = None
+        print("   Using input image as-is (no blur simulated).")
+    else:
+        print("   Simulating blur + noise...")
+        rng = np.random.default_rng(42)
+        if image.ndim == 3:
+            blurred = np.stack([fftconvolve(image[:, :, c], psf, mode='same') for c in range(image.shape[2])], axis=2)
+        else:
+            blurred = fftconvolve(image, psf, mode='same')
+        blurred = np.clip(blurred + rng.normal(0, 0.01, blurred.shape), 0, 1)
+        original = image
 
-# SageMath parsed files
-*.sage.py
+    # Deblur
+    print("\n🔧 Applying Wiener Filter...")
+    wiener_out = wiener_filter(blurred, psf, K=args.K)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    print(f"🔧 Applying Richardson-Lucy ({args.iters} iterations)...")
+    rl_out = richardson_lucy(blurred, psf, iterations=args.iters)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+    # Save outputs
+    io.imsave(os.path.join(args.outdir, 'deblurred_wiener.png'), (wiener_out * 255).astype(np.uint8))
+    io.imsave(os.path.join(args.outdir, 'deblurred_rl.png'),     (rl_out * 255).astype(np.uint8))
+    print(f"\n💾 Saved: deblurred_wiener.png")
+    print(f"💾 Saved: deblurred_rl.png")
 
-# Rope project settings
-.ropeproject
+    # Metrics (only if we have a reference)
+    metrics_dict = None
+    if original is not None:
+        metrics_dict = {
+            'wiener_psnr': compute_psnr(original, wiener_out),
+            'wiener_ssim': compute_ssim(original, wiener_out),
+            'rl_psnr':     compute_psnr(original, rl_out),
+            'rl_ssim':     compute_ssim(original, rl_out),
+        }
+        print("\n📊 Metrics (vs. original):")
+        print(f"   Wiener  → PSNR: {metrics_dict['wiener_psnr']:.2f} dB  |  SSIM: {metrics_dict['wiener_ssim']:.4f}")
+        print(f"   RL      → PSNR: {metrics_dict['rl_psnr']:.2f} dB  |  SSIM: {metrics_dict['rl_ssim']:.4f}")
 
-# mkdocs documentation
-/site
+    # Comparison figure
+    ref_for_plot = original if original is not None else blurred
+    save_comparison(ref_for_plot, blurred, wiener_out, rl_out,
+                    os.path.join(args.outdir, 'comparison.png'), metrics_dict)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    print("\n✅ Done!")
 
-# Pyre type checker
-.pyre/
 
-# pytype static type analyzer
-.pytype/
+if __name__ == '__main__':
+    import sys
+    sys.argv = [
+        'deblur_image.py',
+        '--image', '/000001.png',  # ← PUT YOUR PATH HERE
+        '--blur', 'gaussian',   # gaussian / motion / defocus
+        '--sigma', '2',         # blur strength
+        '--iters', '30',        # Richardson-Lucy iterations
+        '--outdir', '.'         # folder to save results
+    ]
+    main()
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from ultralytics import YOLO
+import os # Import os module to check file existence
 
-# Cython debug symbols
-cython_debug/
+# -----------------------------
+# 1. Load YOLOv8 model
+# -----------------------------
+model = YOLO("yolov8n.pt")
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# -----------------------------
+# 2. Load image
+# -----------------------------
+image_path = "deblurred_wiener.png"  # change this
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+# Check if the image file exists
+if not os.path.exists(image_path):
+    print(f"Error: Image file not found at {image_path}. Please ensure the previous cell successfully created it or provide a correct path.")
+    raise FileNotFoundError(f"Image file not found: {image_path}")
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+original = cv2.imread(image_path)
 
-# Ruff stuff:
-.ruff_cache/
+# Check if the image was loaded successfully by OpenCV
+if original is None:
+    print(f"Error: OpenCV could not load the image from {image_path}. It might be corrupted or an invalid format.")
+    raise ValueError(f"Failed to load image with OpenCV: {image_path}")
 
-# PyPI configuration file
-.pypirc
+original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+# -----------------------------
+# 3. Create blurred image
+# -----------------------------
+def apply_blur(img):
+    return cv2.GaussianBlur(img, (15, 15), 0)
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
+blurred = apply_blur(original)
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# -----------------------------
+# 4. Simple deblurring (Wiener-like approximation)
+# -----------------------------
+def deblur_image(img):
+    # sharpening kernel (approx deblurring)
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+    return cv2.filter2D(img, -1, kernel)
+
+deblurred = deblur_image(blurred)
+
+# -----------------------------
+# 5. Run detection
+# -----------------------------
+def run_detection(img):
+    start = time.time()
+    results = model(img)
+    latency = time.time() - start
+
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    scores = results[0].boxes.conf.cpu().numpy()
+    classes = results[0].boxes.cls.cpu().numpy()
+
+    return boxes, scores, classes, results, latency
+
+boxes_blur, scores_blur, cls_blur, res_blur, time_blur = run_detection(blurred)
+boxes_deblur, scores_deblur, cls_deblur, res_deblur, time_deblur = run_detection(deblurred)
+
+# -----------------------------
+# 6. Draw bounding boxes
+# -----------------------------
+def draw_boxes(img, boxes, scores):
+    img_copy = img.copy()
+    for box, score in zip(boxes, scores):
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0,255,0), 2)
+        cv2.putText(img_copy, f"{score:.2f}", (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+    return img_copy
+
+img_blur_boxes = draw_boxes(blurred, boxes_blur, scores_blur)
+img_deblur_boxes = draw_boxes(deblurred, boxes_deblur, scores_deblur)
+
+# -----------------------------
+# 7. Metrics
+# -----------------------------
+def compute_metrics(scores):
+    if len(scores) == 0:
+        return 0
+    return np.mean(scores)
+
+avg_conf_blur = compute_metrics(scores_blur)
+avg_conf_deblur = compute_metrics(scores_deblur)
+
+# -----------------------------
+# 8. Display results
+# -----------------------------
+plt.figure(figsize=(12,6))
+
+plt.subplot(1,2,1)
+plt.imshow(img_blur_boxes)
+plt.title(f"Blurred\nDetections: {len(scores_blur)} | Conf: {avg_conf_blur:.2f}")
+plt.axis("off")
+
+plt.subplot(1,2,2)
+plt.imshow(img_deblur_boxes)
+plt.title(f"Deblurred\nDetections: {len(scores_deblur)} | Conf: {avg_conf_deblur:.2f}")
+plt.axis("off")
+
+plt.show()
+
+# -----------------------------
+# 9. Print comparison
+# -----------------------------
+print("===== RESULTS =====")
+print(f"Blurred:   {len(scores_blur)} objects | Avg Confidence: {avg_conf_blur:.2f} | Time: {time_blur:.3f}s")
+print(f"Deblurred: {len(scores_deblur)} objects | Avg Confidence: {avg_conf_deblur:.2f} | Time: {time_deblur:.3f}s")
+
