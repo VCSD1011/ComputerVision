@@ -1,0 +1,23 @@
+
+
+Prompt to AI:
+  "Implement a Wiener filter for image deblurring."
+ 
+
+Prompt to AI:
+  "Implement the Richardson-Lucy iterative deconvolution algorithm in
+   Python.
+Prompt to AI:
+  "Write a function that displays and saves a 4-panel side-by-side
+   comparison of: Original, Blurred, Wiener output, and Richardson-Lucy
+   output. Include PSNR/SSIM scores as a caption if provided."
+ 
+Prompt to AI:
+  "Write a batch object detection script using YOLOv8 (ultralytics) that
+   runs inference over a folder of images and logs filename, object count,
+   average confidence, and inference latency to a CSV file."
+  
+Prompt to AI:
+  "Write code to auto-label deblurred images using YOLOv8, organise them
+   into a YOLO-format dataset (train/val/test splits), generate a
+   dataset.yaml, and fine-tune a YOLOv8n model on the resulting dataset."
